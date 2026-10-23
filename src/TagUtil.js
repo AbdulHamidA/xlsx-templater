@@ -1,5 +1,6 @@
 import { default as ImageUtil } from './ImageUtil.js';
 import { default as ExcelUtil } from './ExcelUtil.js';
+import { getRenderOptions } from './RenderOptions.js';
 /**
  * 封装了用于匹配各种tag的正则
  */
@@ -40,39 +41,55 @@ class TagUtil {
    * @param {*} imageIndexInCell, 该图片是单元格中的第几个
    */
   static async replaceImageCellTag(cell, data, imageCount=1, imageIndexInCell=0){
-    let res= TagUtil.getImageTag(cell.value)
-    if (res.tag) {      
-      let workbook = cell.worksheet.workbook
-      for(let index=0; index<res.tag.length; index++){
-        let tag = res.tag[index]      
-        let imageUrl = ''
-        if (tag in data) {
-          imageUrl = data[tag]
-          try {
-            let imageData = await ImageUtil.getImageData(imageUrl)
-            let imageId = workbook.addImage({
-              buffer: imageData,
-              extension: ImageUtil.getImageExt(imageUrl)
-            })
-            cell.value = cell.value.replace(res.tagH[index], '')
-            let rc = ExcelUtil.getRowColumn(cell.address)                 
-            // 实现的效果就是，图片始终限制在这个单元格内，
-            // 右下角对齐，第一章图片撑满，后面每个图片都缩小20%
-            let columnWidthAdjust = 0.2*imageIndexInCell
-            let rowWidthAdjust = 0.2*imageIndexInCell
-            let param = {
-              tl: {col: rc.c-1 + columnWidthAdjust, row: rc.r-1 + rowWidthAdjust}, 
-              br: {col: rc.c, row: rc.r}
-            }
-            // console.log('image replacer param', cell.address, param)            
-            cell.worksheet.addImage(imageId, param)            
-            // cell.worksheet.addImage(imageId, `${cell.address}:${cell.address}`)
-          } catch (error) {
-            console.error('replace image faild', imageUrl, error)
-            continue
-          }
+    let res= TagUtil.getImageTag(cell.value);
+    if (!res.tag) return;
+    let workbook = cell.worksheet.workbook;
+    let opts = getRenderOptions(workbook);
+    for(let index=0; index<res.tag.length; index++){
+      let tag = res.tag[index];
+      if (!(tag in data)) continue;
+      let value = data[tag];
+      let ctx = {
+        tag: tag,
+        value: value,
+        cellAddress: cell.address,
+        worksheetName: cell.worksheet.name,
+        imageCount: imageCount,
+        imageIndexInCell: imageIndexInCell
+      };
+      let image = null;
+      let imageId = null;
+      try {
+        image = await ImageUtil.loadImage(value, tag, ctx, opts);
+        if (image) {
+          imageId = workbook.addImage({ buffer: image.buffer, extension: image.extension });
+        }
+      } catch (error) {
+        if (opts.onImageError) {
+          // The host decides: throwing here aborts the whole render, returning
+          // renders the cell without an image (tag removed below).
+          opts.onImageError(error, ctx);
+          image = null;
+        } else {
+          // Upstream behaviour: log and leave the tag in the cell.
+          console.error('replace image faild', value, error);
+          continue
         }
       }
+      // The tag is removed whether or not an image was drawn: a `null` from the
+      // loader means "no image here", not "leave the placeholder text".
+      cell.value = cell.value.replace(res.tagH[index], '');
+      if (!image || imageId == null) continue;
+      let rc = ExcelUtil.getRowColumn(cell.address);
+      // 实现的效果就是，图片始终限制在这个单元格内，
+      // 右下角对齐，第一章图片撑满，后面每个图片都缩小20%
+      let columnWidthAdjust = 0.2*imageIndexInCell;
+      let rowWidthAdjust = 0.2*imageIndexInCell;
+      let param = {
+        tl: {col: rc.c-1 + columnWidthAdjust, row: rc.r-1 + rowWidthAdjust},
+        br: {col: rc.c, row: rc.r}
+      };
+      cell.worksheet.addImage(imageId, param);
     }
   }
   /**

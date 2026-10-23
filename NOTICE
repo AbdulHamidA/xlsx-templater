@@ -1,0 +1,16 @@
+xlsxtemplater-dms 1.2.1-dms.1
+
+This package is a modified copy of @sailimuhu/xlsxtemplater 1.2.1
+(https://github.com/yangguichun/xlsx-templater), Copyright yangguichun,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Modified by the DocumentService-DMS project. Changed files:
+  dist/xlsxtemplater.cjs      - image handling rewritten (see below); node-fetch removed
+  src/ImageUtil.js            - pluggable image loader; Buffer / data: URL / http(s) support
+  src/RenderOptions.js        - new: per-render options (imageLoader, onImageError, limits)
+  src/TagUtil.js              - replaceImageCellTag uses the loader and the error hook
+  src/XlsxTemplater.js        - renderFromFile/renderFromBuffer/_findWorksheetAndRender accept options
+  package.json                - renamed, CommonJS-only entry, node-fetch dependency dropped
+  dist/xlsxtemplater.mjs, dist/xlsxtemplater.umd.js - removed (Node-only package)
+
+Upstream tarball integrity: sha512-t5m7hDUWG9/KAFQA1JsAnNkxPrJDq6ogf6tsm2b5ZYReD9FBq4y0FFcN1cWF8EdSS3xL5sFcs15AuQyRzY68/A==

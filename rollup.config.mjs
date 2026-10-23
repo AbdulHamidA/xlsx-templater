@@ -2,17 +2,17 @@ import resolve from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import json from '@rollup/plugin-json';
 
+// xlsxtemplater-dms is a Node-only package: a single CommonJS bundle.
+// The upstream ESM and UMD (browser) builds were dropped together with the
+// node-fetch dependency — image loading now uses global fetch / Buffer /
+// AbortController (Node 18+) or the host's own imageLoader.
 const external = [
   'exceljs',
+  'lodash',
+  'lodash/cloneDeep',
   'path',
   'fs',
   'url',
-  'node-fetch',
-  'lodash',
-  'lodash/cloneDeep',
-  'tr46',
-  'whatwg-url',
-  'webidl-conversions',
   'buffer',
   'stream',
   'string_decoder',
@@ -23,7 +23,6 @@ const external = [
 ];
 
 export default [
-  // CommonJS build
   {
     input: 'src/XlsxTemplater.js',
     output: {
@@ -33,62 +32,11 @@ export default [
     },
     external,
     plugins: [
-      resolve({ 
+      resolve({
         preferBuiltins: true,
         browser: false,
         extensions: ['.js', '.mjs', '.json']
-      }), 
-      commonjs({
-        ignoreDynamicRequires: true,
-        transformMixedEsModules: true,
-        include: /node_modules/
       }),
-      json()
-    ]
-  },
-  // ESM build
-  {
-    input: 'src/XlsxTemplater.js',
-    output: {
-      file: 'dist/xlsxtemplater.mjs',
-      format: 'es'
-    },
-    external,
-    plugins: [
-      resolve({ 
-        preferBuiltins: true,
-        browser: false,
-        extensions: ['.js', '.mjs', '.json']
-      }), 
-      commonjs({
-        ignoreDynamicRequires: true,
-        transformMixedEsModules: true,
-        include: /node_modules/
-      }),
-      json()
-    ]
-  },
-  // UMD build
-  {
-    input: 'src/XlsxTemplater.js',
-    output: {
-      file: 'dist/xlsxtemplater.umd.js',
-      format: 'umd',
-      name: 'XlsxTemplater',
-      globals: {
-        exceljs: 'ExcelJS',
-        'node-fetch': 'fetch',
-        'lodash': '_',
-        'lodash/cloneDeep': '_.cloneDeep'
-      }
-    },
-    external,
-    plugins: [
-      resolve({ 
-        preferBuiltins: true,
-        browser: true,
-        extensions: ['.js', '.mjs', '.json']
-      }), 
       commonjs({
         ignoreDynamicRequires: true,
         transformMixedEsModules: true,
@@ -97,4 +45,4 @@ export default [
       json()
     ]
   }
-]; 
+];

@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs'
 import { TagUtil } from './TagUtil.js'
+import { RENDER_OPTIONS, normalizeRenderOptions } from './RenderOptions.js'
 import { default as ExcelUtil } from './ExcelUtil.js'
 import { default as AtTagHandler } from './AtTagHandler.js'
 import { default as LoopRowHandler } from './LoopRowHandler.js'
@@ -14,53 +15,62 @@ class XlsxTemplater {
     this._data = data
   }
   /**
-   * 使用data渲染 filePath路径下的文件，并返回渲染后的workbook   
-   * @param {*} filePath 
-   * @param {*} data 
+   * 使用data渲染 filePath路径下的文件，并返回渲染后的workbook
+   * @param {*} filePath
+   * @param {*} data
    * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染所有worksheet
+   * @param {*} options DMS fork: { imageLoader, onImageError, imageTimeoutMs, imageMaxBytes }
    * @returns 渲染后的workbook
    */
-  static async renderFromFile(filePath, data, worksheetNameList=[]){
-    let workbook = new ExcelJS.Workbook()
-    // workbook.getWorksheet().addConditionalFormatting
-    await workbook.xlsx.readFile(filePath)
-    await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList)
+  static async renderFromFile(filePath, data, worksheetNameList=[], options={}){
+    let normalized = normalizeRenderOptions(options); // validates before any I/O
+    let workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(filePath);
+    await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList, normalized);
     return workbook
   }
   /**
    * 解析从buffer中读取的Excel文件，用data渲染，然后再返回为buffer
-   * @param {*} buffer 
-   * @param {*} data 
+   * @param {*} buffer
+   * @param {*} data
    * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染所有worksheet
+   * @param {*} options DMS fork: { imageLoader, onImageError, imageTimeoutMs, imageMaxBytes }
    * @returns 返回一个Buffer
    */
-    static async renderFromBuffer(buffer, data, worksheetNameList=[]){
-      let workbook = new ExcelJS.Workbook()
-      await workbook.xlsx.load(buffer)
-      await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList)    
-      return await workbook.xlsx.writeBuffer()
-    }
+  static async renderFromBuffer(buffer, data, worksheetNameList=[], options={}){
+    let normalized = normalizeRenderOptions(options); // validates before any I/O
+    let workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
+    await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList, normalized);
+    return await workbook.xlsx.writeBuffer()
+  }
   /**
-   * 
+   *
    * @param {*} workbook，要渲染的workbook
    * @param {*} data，用于渲染的json格式数据
    * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染所有worksheet
+   * @param {*} options DMS fork render options (see normalizeRenderOptions)
    */
-  static async _findWorksheetAndRender(workbook, data, worksheetNameList){
-    let renderWorksheetList = []
-    if(worksheetNameList == null || worksheetNameList === undefined || worksheetNameList.length == 0){      
-      renderWorksheetList = workbook.worksheets
-    }else{
+  static async _findWorksheetAndRender(workbook, data, worksheetNameList, options){
+    let renderWorksheetList = [];
+    if(worksheetNameList == null || worksheetNameList === undefined || worksheetNameList.length == 0){
+      renderWorksheetList = workbook.worksheets;
+    }else {
       workbook.worksheets.forEach(item=>{
         if(worksheetNameList.indexOf(item.name)>=0){
-          renderWorksheetList.push(item)
+          renderWorksheetList.push(item);
         }
-      })
+      });
     }
-    for(let i = 0; i<renderWorksheetList.length; i++){
-      let templater = new XlsxTemplater(renderWorksheetList[i], data)
-      await templater.render()
-    }   
+    RENDER_OPTIONS.set(workbook, normalizeRenderOptions(options));
+    try {
+      for(let i = 0; i<renderWorksheetList.length; i++){
+        let templater = new XlsxTemplater(renderWorksheetList[i], data);
+        await templater.render();
+      }
+    } finally {
+      RENDER_OPTIONS.delete(workbook);
+    }
   }
   /**
    * 便利数据表内的所有单元格

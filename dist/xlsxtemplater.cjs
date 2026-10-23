@@ -1,44 +1,183 @@
 'use strict';
 
 var ExcelJS = require('exceljs');
-var fetch = require('node-fetch');
 var cloneDeep = require('lodash/cloneDeep');
 
 function _interopDefaultLegacy (e) { return e && typeof e === 'object' && 'default' in e ? e : { 'default': e }; }
 
 var ExcelJS__default = /*#__PURE__*/_interopDefaultLegacy(ExcelJS);
-var fetch__default = /*#__PURE__*/_interopDefaultLegacy(fetch);
 var cloneDeep__default = /*#__PURE__*/_interopDefaultLegacy(cloneDeep);
 
+// ---- DMS fork: per-render options -----------------------------------------
+// Options given to renderFromBuffer()/renderFromFile() reach the image tag
+// handler through a WeakMap keyed by the ExcelJS Workbook being rendered, so
+// concurrent renders in one process never see each other's options and no
+// mutable static state is introduced.
+var RENDER_OPTIONS = new WeakMap();
+var DEFAULT_IMAGE_TIMEOUT_MS = 15000;
+var DEFAULT_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
+
+function positiveNumber(value, fallback) {
+  var n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 /**
- * 图像的辅助工具
+ * Validate and normalise render options.
+ * @param {object} [options]
+ * @param {function} [options.imageLoader]  async (value, tag, ctx, opts) => { buffer, extension } | null
+ *        Resolves an image tag's raw data value to bytes. `null` = no image
+ *        (the tag is removed, nothing is drawn). Throwing marks the image as
+ *        failed (see onImageError).
+ * @param {function} [options.onImageError] (error, ctx) => void
+ *        Called instead of console.error when an image fails; throwing from it
+ *        aborts the render. When omitted the upstream behaviour applies: the
+ *        error is logged and the tag is left in the cell.
+ * @param {number} [options.imageTimeoutMs=15000]  default loader: fetch timeout
+ * @param {number} [options.imageMaxBytes=15 MiB]   default loader: response cap
+ */
+function normalizeRenderOptions(options) {
+  var o = options && typeof options === 'object' ? options : {};
+  if (o.imageLoader !== undefined && o.imageLoader !== null && typeof o.imageLoader !== 'function') {
+    throw new TypeError('xlsxtemplater: options.imageLoader must be a function');
+  }
+  if (o.onImageError !== undefined && o.onImageError !== null && typeof o.onImageError !== 'function') {
+    throw new TypeError('xlsxtemplater: options.onImageError must be a function');
+  }
+  return {
+    imageLoader: o.imageLoader || null,
+    onImageError: o.onImageError || null,
+    imageTimeoutMs: positiveNumber(o.imageTimeoutMs, DEFAULT_IMAGE_TIMEOUT_MS),
+    imageMaxBytes: positiveNumber(o.imageMaxBytes, DEFAULT_IMAGE_MAX_BYTES)
+  };
+}
+
+function getRenderOptions(workbook) {
+  return (workbook && RENDER_OPTIONS.get(workbook)) || normalizeRenderOptions(null);
+}
+
+/**
+ * 图像的辅助工具 / image helpers.
+ *
+ * DMS fork: images are resolved by a pluggable loader instead of an unguarded
+ * node-fetch of an http(s) URL. The default loader understands Buffers,
+ * Uint8Array/ArrayBuffer, data: URLs and http(s) URLs (global fetch with a
+ * timeout and a byte cap). Hosts that must control outbound traffic pass
+ * `options.imageLoader` and never let this module touch the network.
  */
 class ImageUtil{
+  /** png | jpeg | gif from the magic bytes, else null. */
+  static sniffExtension(buf){
+    if(!buf || buf.length < 4) return null;
+    if(buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+    if(buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg';
+    if(buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif';
+    return null
+  }
+
   /**
-   * 通过url获取对应的图像文件数据
+   * ExcelJS writes `image/<extension>` into [Content_Types].xml, so only the
+   * three formats Excel renders are allowed and `jpg` becomes `jpeg`; anything
+   * else falls back to the sniffed type, then png.
+   */
+  static normalizeExtension(ext, buf){
+    let e = String(ext || '').toLowerCase().replace(/^\./, '');
+    if(e === 'jpg') e = 'jpeg';
+    if(e === 'png' || e === 'jpeg' || e === 'gif') return e;
+    return ImageUtil.sniffExtension(buf) || 'png'
+  }
+
+  static toBuffer(data){
+    if(Buffer.isBuffer(data)) return data;
+    if(data instanceof ArrayBuffer) return Buffer.from(data);
+    if(ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    return null
+  }
+
+  /**
+   * Default loader. Accepts a Buffer/typed array, `{ buffer, extension }`, a
+   * data: URL or an http(s) URL. Throws for anything else, for a non-2xx
+   * response, on timeout, or when the body exceeds imageMaxBytes.
+   */
+  static async defaultImageLoader(value, tag, ctx, opts){
+    opts = opts || {};
+    let direct = ImageUtil.toBuffer(value);
+    if(direct) return { buffer: direct, extension: ImageUtil.sniffExtension(direct) || 'png' };
+    if(value && typeof value === 'object' && !Array.isArray(value)){
+      let inner = ImageUtil.toBuffer(value.buffer);
+      if(inner) return { buffer: inner, extension: value.extension };
+    }
+    if(typeof value !== 'string'){
+      throw new Error('unsupported image value for {%' + tag + '}: expected a Buffer, a data: URL or an http(s) URL')
+    }
+    let raw = value.trim();
+    let dataUrl = /^data:(image\/[a-z0-9.+-]+)?\s*;\s*base64\s*,\s*([A-Za-z0-9+/=\s]+)$/i.exec(raw);
+    if(dataUrl){
+      let buf = Buffer.from(dataUrl[2].replace(/\s+/g, ''), 'base64');
+      let mime = (dataUrl[1] || '').toLowerCase();
+      return { buffer: buf, extension: mime.startsWith('image/') ? mime.slice(6) : ImageUtil.sniffExtension(buf) }
+    }
+    if(!/^https?:\/\/.+/i.test(raw)){
+      throw new Error('unsupported image value for {%' + tag + '}: expected a Buffer, a data: URL or an http(s) URL')
+    }
+    let url = raw.split(/\s+/)[0];
+    let timeoutMs = opts.imageTimeoutMs || DEFAULT_IMAGE_TIMEOUT_MS;
+    let maxBytes = opts.imageMaxBytes || DEFAULT_IMAGE_MAX_BYTES;
+    let controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      let res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+      if(!res.ok) throw new Error('image request for {%' + tag + '} failed with HTTP ' + res.status);
+      let chunks = [];
+      let total = 0;
+      if(res.body && typeof res.body.getReader === 'function'){
+        let reader = res.body.getReader();
+        while(true){
+          let step = await reader.read();
+          if(step.done) break;
+          total += step.value.byteLength;
+          if(total > maxBytes){
+            controller.abort();
+            throw new Error('image for {%' + tag + '} exceeds ' + maxBytes + ' bytes')
+          }
+          chunks.push(Buffer.from(step.value));
+        }
+      } else {
+        let arr = Buffer.from(await res.arrayBuffer());
+        if(arr.length > maxBytes) throw new Error('image for {%' + tag + '} exceeds ' + maxBytes + ' bytes');
+        chunks.push(arr);
+      }
+      return { buffer: Buffer.concat(chunks), extension: ImageUtil.getImageExt(url) }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Resolve a tag value to `{ buffer, extension }` (or null for "no image")
+   * through options.imageLoader or the default loader.
+   */
+  static async loadImage(value, tag, ctx, opts){
+    let loader = (opts && opts.imageLoader) || ImageUtil.defaultImageLoader;
+    let res = await loader(value, tag, ctx, opts);
+    if(res == null) return null;
+    let buf = ImageUtil.toBuffer(res && res.buffer !== undefined ? res.buffer : res);
+    if(!buf || !buf.length) return null;
+    return { buffer: buf, extension: ImageUtil.normalizeExtension(res && res.extension, buf) }
+  }
+
+  /**
+   * 通过url获取对应的图像文件数据 (kept for callers of the upstream API;
+   * resolves to a Buffer instead of an ArrayBuffer — both are accepted by
+   * ExcelJS addImage).
    * @param {*} url 必须是绝对路径
-   * @returns 
    */
   static getImageData(url){
     let urlPattern = /^http[s]{0,1}:\/\/.+/i;
     if(!urlPattern.test(url)){
       return Promise.reject('url格式不正确，必须是绝对路径')
     }
-
-    return new Promise((resolve, reject)=>{
-      console.log('image loading', url);
-      fetch__default["default"](url).then((res) => {
-        res.blob().then((blob) => {
-          blob.arrayBuffer().then((arr)=>{
-            console.log('image loaded', url);
-            resolve(arr);
-          });      
-        });
-      })
-      .catch(err=>{
-        reject(err);
-      });
-    })
+    return ImageUtil.defaultImageLoader(url, '', {}, normalizeRenderOptions(null)).then((r) => r.buffer)
   }
 
   /**
@@ -49,7 +188,7 @@ class ImageUtil{
    */
   static getImageExt(url){
     let pattern = /.+\.(\w+)$/i;
-    let matches = pattern.exec(url);
+    let matches = pattern.exec(String(url).split(/[?#]/)[0]);
     if(matches && matches.length>=2){
       return matches[1]
     }
@@ -299,38 +438,54 @@ class TagUtil {
    */
   static async replaceImageCellTag(cell, data, imageCount=1, imageIndexInCell=0){
     let res= TagUtil.getImageTag(cell.value);
-    if (res.tag) {      
-      let workbook = cell.worksheet.workbook;
-      for(let index=0; index<res.tag.length; index++){
-        let tag = res.tag[index];      
-        let imageUrl = '';
-        if (tag in data) {
-          imageUrl = data[tag];
-          try {
-            let imageData = await ImageUtil.getImageData(imageUrl);
-            let imageId = workbook.addImage({
-              buffer: imageData,
-              extension: ImageUtil.getImageExt(imageUrl)
-            });
-            cell.value = cell.value.replace(res.tagH[index], '');
-            let rc = ExcelUtil.getRowColumn(cell.address);                 
-            // 实现的效果就是，图片始终限制在这个单元格内，
-            // 右下角对齐，第一章图片撑满，后面每个图片都缩小20%
-            let columnWidthAdjust = 0.2*imageIndexInCell;
-            let rowWidthAdjust = 0.2*imageIndexInCell;
-            let param = {
-              tl: {col: rc.c-1 + columnWidthAdjust, row: rc.r-1 + rowWidthAdjust}, 
-              br: {col: rc.c, row: rc.r}
-            };
-            // console.log('image replacer param', cell.address, param)            
-            cell.worksheet.addImage(imageId, param);            
-            // cell.worksheet.addImage(imageId, `${cell.address}:${cell.address}`)
-          } catch (error) {
-            console.error('replace image faild', imageUrl, error);
-            continue
-          }
+    if (!res.tag) return;
+    let workbook = cell.worksheet.workbook;
+    let opts = getRenderOptions(workbook);
+    for(let index=0; index<res.tag.length; index++){
+      let tag = res.tag[index];
+      if (!(tag in data)) continue;
+      let value = data[tag];
+      let ctx = {
+        tag: tag,
+        value: value,
+        cellAddress: cell.address,
+        worksheetName: cell.worksheet.name,
+        imageCount: imageCount,
+        imageIndexInCell: imageIndexInCell
+      };
+      let image = null;
+      let imageId = null;
+      try {
+        image = await ImageUtil.loadImage(value, tag, ctx, opts);
+        if (image) {
+          imageId = workbook.addImage({ buffer: image.buffer, extension: image.extension });
+        }
+      } catch (error) {
+        if (opts.onImageError) {
+          // The host decides: throwing here aborts the whole render, returning
+          // renders the cell without an image (tag removed below).
+          opts.onImageError(error, ctx);
+          image = null;
+        } else {
+          // Upstream behaviour: log and leave the tag in the cell.
+          console.error('replace image faild', value, error);
+          continue
         }
       }
+      // The tag is removed whether or not an image was drawn: a `null` from the
+      // loader means "no image here", not "leave the placeholder text".
+      cell.value = cell.value.replace(res.tagH[index], '');
+      if (!image || imageId == null) continue;
+      let rc = ExcelUtil.getRowColumn(cell.address);
+      // 实现的效果就是，图片始终限制在这个单元格内，
+      // 右下角对齐，第一章图片撑满，后面每个图片都缩小20%
+      let columnWidthAdjust = 0.2*imageIndexInCell;
+      let rowWidthAdjust = 0.2*imageIndexInCell;
+      let param = {
+        tl: {col: rc.c-1 + columnWidthAdjust, row: rc.r-1 + rowWidthAdjust},
+        br: {col: rc.c, row: rc.r}
+      };
+      cell.worksheet.addImage(imageId, param);
     }
   }
   /**
@@ -1292,42 +1447,46 @@ class XlsxTemplater {
     this._data = data;
   }
   /**
-   * 使用data渲染 filePath路径下的文件，并返回渲染后的workbook   
-   * @param {*} filePath 
-   * @param {*} data 
-   * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染第一个worksheet
+   * 使用data渲染 filePath路径下的文件，并返回渲染后的workbook
+   * @param {*} filePath
+   * @param {*} data
+   * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染所有worksheet
+   * @param {*} options DMS fork: { imageLoader, onImageError, imageTimeoutMs, imageMaxBytes }
    * @returns 渲染后的workbook
    */
-  static async renderFromFile(filePath, data, worksheetNameList=[]){
+  static async renderFromFile(filePath, data, worksheetNameList=[], options={}){
+    let normalized = normalizeRenderOptions(options); // validates before any I/O
     let workbook = new ExcelJS__default["default"].Workbook();
-    // workbook.getWorksheet().addConditionalFormatting
     await workbook.xlsx.readFile(filePath);
-    await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList);
+    await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList, normalized);
     return workbook
   }
   /**
    * 解析从buffer中读取的Excel文件，用data渲染，然后再返回为buffer
-   * @param {*} buffer 
-   * @param {*} data 
-   * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染第一个worksheet
+   * @param {*} buffer
+   * @param {*} data
+   * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染所有worksheet
+   * @param {*} options DMS fork: { imageLoader, onImageError, imageTimeoutMs, imageMaxBytes }
    * @returns 返回一个Buffer
    */
-    static async renderFromBuffer(buffer, data, worksheetNameList=[]){
-      let workbook = new ExcelJS__default["default"].Workbook();
-      await workbook.xlsx.load(buffer);
-      await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList);    
-      return await workbook.xlsx.writeBuffer()
-    }
+  static async renderFromBuffer(buffer, data, worksheetNameList=[], options={}){
+    let normalized = normalizeRenderOptions(options); // validates before any I/O
+    let workbook = new ExcelJS__default["default"].Workbook();
+    await workbook.xlsx.load(buffer);
+    await XlsxTemplater._findWorksheetAndRender(workbook, data, worksheetNameList, normalized);
+    return await workbook.xlsx.writeBuffer()
+  }
   /**
-   * 
+   *
    * @param {*} workbook，要渲染的workbook
    * @param {*} data，用于渲染的json格式数据
-   * @param {*} worksheetNameList ，要渲染的worksheet名称列表
+   * @param {*} worksheetNameList ，要渲染的worksheet名称列表，如果不指定，默认就渲染所有worksheet
+   * @param {*} options DMS fork render options (see normalizeRenderOptions)
    */
-  static async _findWorksheetAndRender(workbook, data, worksheetNameList){
+  static async _findWorksheetAndRender(workbook, data, worksheetNameList, options){
     let renderWorksheetList = [];
     if(worksheetNameList == null || worksheetNameList === undefined || worksheetNameList.length == 0){
-      renderWorksheetList = [workbook.worksheets[0]];
+      renderWorksheetList = workbook.worksheets;
     }else {
       workbook.worksheets.forEach(item=>{
         if(worksheetNameList.indexOf(item.name)>=0){
@@ -1335,10 +1494,15 @@ class XlsxTemplater {
         }
       });
     }
-    for(let i = 0; i<renderWorksheetList.length; i++){
-      let templater = new XlsxTemplater(renderWorksheetList[i], data);
-      await templater.render();
-    }   
+    RENDER_OPTIONS.set(workbook, normalizeRenderOptions(options));
+    try {
+      for(let i = 0; i<renderWorksheetList.length; i++){
+        let templater = new XlsxTemplater(renderWorksheetList[i], data);
+        await templater.render();
+      }
+    } finally {
+      RENDER_OPTIONS.delete(workbook);
+    }
   }
   /**
    * 便利数据表内的所有单元格
