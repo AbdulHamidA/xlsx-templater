@@ -1,4 +1,9 @@
 中文文档请参考 [readme.zh-cn.md](readme.zh-cn.md)
+
+> **This repository is `xlsxtemplater-dms`, a fork of [`@sailimuhu/xlsxtemplater`](https://github.com/yangguichun/xlsx-templater) 1.2.1 maintained for the DocumentService-DMS project.**
+> It keeps the whole template engine and changes only image handling: `{%image}` values are resolved through a pluggable `imageLoader` (Buffers, `data:` URLs or a guarded `fetch`), failures surface through an `onImageError` hook instead of `console.error`, and the `node-fetch` dependency and the browser / ESM bundles are gone. Node.js 18+ only.
+> See [Render options](#render-options-dms-fork) below and [NOTICE](NOTICE) for the list of modified files.
+
 # What is xlsxtemplater
 xlsxtemplater uses JavaScript Object or JSON as data input to render an xlsx file.
 
@@ -10,68 +15,45 @@ xlsxtemplater is built on top of [ExcelJS](https://github.com/exceljs/exceljs), 
 
 # Installation
 
+This fork is not published to npm. Build it from a clone and install the packed tarball in the consuming project:
+
 ```bash
-npm install @sailimuhu/xlsxtemplater
-# or
-yarn add @sailimuhu/xlsxtemplater
+git clone https://github.com/AbdulHamidA/xlsx-templater.git
+cd xlsx-templater
+npm install
+npm run build          # rebuilds dist/xlsxtemplater.cjs from src/
+npm pack               # -> xlsxtemplater-dms-<version>.tgz
+
+# in the consuming project
+npm install ./xlsxtemplater-dms-<version>.tgz
 ```
 
+The upstream package remains available as `@sailimuhu/xlsxtemplater` if you do not need the image-loading changes.
+
 ## Dependencies
-- ExcelJS: ^4.3.0
+- ExcelJS: ^4.4.0
+- Node.js >= 18 (global `fetch`, `AbortController`, `Buffer`)
 
 ## Usage
 
 ### Node.js (CommonJS)
 ```javascript
-const XlsxTemplater = require('@sailimuhu/xlsxtemplater');
+const XlsxTemplater = require('xlsxtemplater-dms');
 
-// Create a new instance with your template file
-const templater = new XlsxTemplater('./template.xlsx');
+// From a file on disk: returns the rendered ExcelJS workbook
+const workbook = await XlsxTemplater.renderFromFile('./template.xlsx', data);
+await workbook.xlsx.writeFile('./result.xlsx');
+
+// From a Buffer: returns the rendered xlsx as a Buffer
+const result = await XlsxTemplater.renderFromBuffer(templateBuffer, data, [], {
+  imageLoader: async (value, tag, ctx) => ({ buffer: myBytesFor(value), extension: 'png' }),
+  onImageError: (err, ctx) => { throw err; }
+});
 ```
 
-### Node.js (ESM)
-```javascript
-import XlsxTemplater from '@sailimuhu/xlsxtemplater';
+Both functions take `(source, data, worksheetNameList = [], options = {})`. An empty `worksheetNameList` renders every worksheet. `options` is described under [Render options](#render-options-dms-fork).
 
-// Create a new instance with your template file
-const templater = new XlsxTemplater('./template.xlsx');
-```
-
-### Browser
-```html
-<!-- UMD version -->
-<script src="node_modules/@sailimuhu/xlsxtemplater/dist/xlsxtemplater.umd.js"></script>
-<script>
-  const templater = new XlsxTemplater(file); // file can be Blob/ArrayBuffer
-</script>
-
-<!-- ES Module -->
-<script type="module">
-  import XlsxTemplater from '@sailimuhu/xlsxtemplater';
-  const templater = new XlsxTemplater(file);
-</script>
-```
-
-### Browser Usage Notes
-When using in browser environment:
-1. Input file should be Blob or ArrayBuffer instead of file path
-2. Use `templater.renderToBlob()` instead of `templater.save()`
-```javascript
-// Browser example
-const response = await fetch('template.xlsx');
-const templateFile = await response.arrayBuffer();
-
-const templater = new XlsxTemplater(templateFile);
-await templater.render(data);
-
-// Get result as Blob
-const resultBlob = await templater.renderToBlob();
-// Or download directly
-const link = document.createElement('a');
-link.href = URL.createObjectURL(resultBlob);
-link.download = 'result.xlsx';
-link.click();
-```
+The upstream ESM (`import`) and browser (UMD) builds are not part of this fork; only the CommonJS bundle `dist/xlsxtemplater.cjs` is shipped.
 
 # Quick Start
 ```javascript
@@ -346,6 +328,43 @@ Used to insert images into cells. Example:
 |{%beforePic}|{%afterPic}|
 
 After rendering, these tags will be replaced with the target images. Images will fill the entire cell, so adjust cell size as needed.
+
+In this fork the value behind an image tag may be any of the following (handled by the default loader unless you supply your own `imageLoader`, see below):
+- a `Buffer`, `Uint8Array` or `ArrayBuffer` with the raw image bytes
+- an object `{ buffer, extension }`
+- a `data:image/...;base64,...` URL
+- an `http(s)://` URL, fetched with the global `fetch` under a timeout and a byte cap
+
+Image extensions are normalised to `png`, `jpeg` or `gif` (`jpg` becomes `jpeg`; anything else is sniffed from the magic bytes). If the loader returns `null`, the tag is removed from the cell and no image is drawn.
+
+# Render options (DMS fork)
+
+`renderFromFile(filePath, data, worksheetNameList = [], options = {})` and `renderFromBuffer(buffer, data, worksheetNameList = [], options = {})` accept an `options` object:
+
+| Option | Type | Default | Purpose |
+|---|---|---|---|
+| `imageLoader` | `async (value, tag, ctx, opts) => { buffer, extension } \| null` | built-in loader | Resolves an image tag's raw data value to bytes. Return `null` for "no image here" (the tag is removed, nothing is drawn). Throwing marks the image as failed. Pass your own loader when the host must control outbound traffic; the library then never touches the network. |
+| `onImageError` | `(error, ctx) => void` | not set | Called instead of `console.error` when an image fails. Throwing from it aborts the whole render; returning renders the cell without an image. When omitted, the upstream behaviour applies: the error is logged and the tag is left in the cell. |
+| `imageTimeoutMs` | number | `15000` | Timeout for the default loader's `fetch`. |
+| `imageMaxBytes` | number | `15 * 1024 * 1024` | Maximum response size the default loader accepts. |
+
+`ctx` is `{ tag, value, cellAddress, worksheetName, imageCount, imageIndexInCell }`.
+
+Options are validated before any I/O (`imageLoader` / `onImageError` must be functions when given). They travel to the tag handler through a `WeakMap` keyed by the ExcelJS workbook being rendered, so concurrent renders in one process never see each other's options and the module keeps no mutable static state.
+
+```javascript
+const images = new Map([['logo', fs.readFileSync('logo.png')]]);
+
+const out = await XlsxTemplater.renderFromBuffer(template, { title: 'Report', logo: 'logo' }, [], {
+  imageLoader: async (value, tag, ctx) => {
+    const buffer = images.get(value);
+    return buffer ? { buffer, extension: 'png' } : null;
+  },
+  onImageError: (err, ctx) => {
+    throw new Error(`image ${ctx.tag} in ${ctx.worksheetName}!${ctx.cellAddress}: ${err.message}`);
+  }
+});
+```
 
 # Conditional Formatting Support
 When using loop tags that add or delete rows, conditional formatting in the worksheet might be affected. Therefore:
